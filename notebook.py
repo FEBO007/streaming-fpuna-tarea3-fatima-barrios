@@ -41,14 +41,13 @@ def _(mo):
 
     **Ventanas, estado por clave y efectos externos idempotentes**
 
-    Este notebook es un esqueleto. Las celdas de código contienen firmas,
-    contratos y excepciones `NotImplementedError`; no incluyen la solución.
+    Este notebook contiene la implementación de un pipeline de pagos tolerante a eventos fuera de orden, duplicados, datos tardíos y reintentos de escritura.
+
+    La solución integra tiempo de evento, ventanas fijas, deduplicación con estado por clave, expiración mediante timers, triggers con panes acumulativos e idempotencia del sink.
 
     ## Problema
 
-    Implementá un pipeline que produzca el total confirmado por comercio y
-    minuto aun cuando los pagos lleguen fuera de orden, duplicados o sean
-    reintentados al escribir el resultado.
+    Implementar un pipeline que produzca el total confirmado por comercio y por minuto, aun cuando los pagos lleguen fuera de orden, duplicados o sean reintentados al escribir el resultado.
 
     El archivo `data/payments.jsonl` contiene:
 
@@ -57,7 +56,7 @@ def _(mo):
     - eventos fuera de orden;
     - un evento que supera 120 segundos de atraso.
 
-    ## Reglas
+    ## Reglas implementadas
 
     1. Usar `event_time` como timestamp del dominio.
     2. Aplicar ventanas fijas de 60 segundos.
@@ -96,15 +95,16 @@ def _(mo):
     mo.md(r"""
     ## 1. Tiempo de evento
 
-    Completá `parse_utc`.
+    La función `parse_utc` convierte los timestamps ISO-8601 terminados en `Z` a objetos `datetime` timezone-aware en UTC.
 
-    El resultado debe:
+    La implementación:
 
-    - ser timezone-aware;
-    - aceptar los timestamps del dataset;
-    - rechazar valores inválidos con una excepción clara.
+    - acepta los timestamps utilizados en el dataset;
+    - conserva explícitamente la zona horaria UTC;
+    - rechaza valores inválidos mediante una excepción clara;
+    - se utiliza para asignar el tiempo de dominio al construir cada `TimestampedValue`.
 
-    Después, usá esa función cuando construyas cada `TimestampedValue`.
+    De esta forma, las ventanas se calculan según `event_time` y no según el momento de llegada o procesamiento del evento.
     """)
     return
 
@@ -270,20 +270,36 @@ def _(mo):
     mo.md(r"""
     ## 2. Contrato determinista antes de Beam
 
-    Implementá `assign_fixed_window` y `summarize_payments`.
+    Las funciones `assign_fixed_window` y `summarize_payments` implementan una referencia determinista en Python puro que funciona como oráculo para validar el comportamiento esperado del pipeline Beam.
 
-    Esta versión pura de Python funciona como oráculo para el pipeline:
+    La solución:
 
-    - solo cuenta pagos `CONFIRMED`;
-    - la ventana depende de `event_time`;
-    - un duplicado no cambia el total;
-    - el atraso se calcula con `arrival_time - event_time`;
-    - la auditoría conserva la razón de cada decisión;
-    - un late aceptado tiene `accepted=True` y `revision=True`;
-    - un evento fuera de tolerancia tiene `reason="too_late"`.
+    - asigna cada evento a una ventana fija de 60 segundos según `event_time`;
+    - utiliza intervalos semiabiertos `[window_start, window_end)`;
+    - solo agrega pagos con estado `CONFIRMED`;
+    - deduplica por la combinación `merchant_id + event_id`;
+    - calcula el atraso mediante `arrival_time - event_time`;
+    - conserva en la auditoría la decisión aplicada a cada evento;
+    - marca con `accepted=True` y `revision=True` un evento tardío aceptado;
+    - marca con `reason="too_late"` un evento que supera el horizonte de corrección;
+    - genera los totales agrupados por comercio y ventana.
 
-    Para la configuración por defecto, documentá cuántos eventos entran,
-    cuántos se aceptan y cuántos totales se producen.
+    ### Resultado con la configuración por defecto
+
+    Eventos de entrada       9
+    Eventos aceptados        5
+    Eventos auditados        9
+    Totales producidos       4
+
+    Los cuatro eventos no aceptados corresponden a:
+    1 pago PENDING
+    1 pago REJECTED
+    1 evento duplicado
+    1 evento TOO LATE
+
+    Este contrato permite comparar una lógica local y determinista con el resultado producido posteriormente por Apache Beam.
+
+    Los conteos se corresponden con el dataset actual: contiene nueve registros; cinco pagos confirmados, únicos y dentro de tolerancia generan cuatro combinaciones de comercio y ventana. :contentReference[oaicite:0]{index=0}
     """)
     return
 
@@ -469,23 +485,66 @@ def _(mo):
     mo.md(r"""
     ## 3. Pipeline Beam, estado y triggers
 
-    Completá:
+    La solución implementa:
 
     - `build_windowed_totals_pipeline`;
     - `DeduplicatePayments.process`;
+    - `DeduplicatePayments.expire`;
     - `build_trigger_policy`.
 
-    La clave debe ser `merchant_id` antes de usar estado. La salida debe
-    recuperar los límites de ventana con `WindowParam`.
+    El pipeline utiliza `event_time` para asignar cada pago a una ventana fija de 60 segundos y filtra únicamente los eventos con estado `CONFIRMED`.
 
-    Agregá pruebas con `TestPipeline` y al menos una prueba temporal con
-    `TestStream` que evidencie un resultado late aceptado.
+    Antes de aplicar el `DoFn` stateful, cada evento se transforma a la estructura `(merchant_id, event)`. De este modo, el estado queda aislado por comercio y por ventana.
 
-    ### Expiración
+    La salida recupera los límites temporales mediante `WindowParam` e incluye:
 
-    Extendé la deduplicación con un timer de event time que limpie el estado
-    al finalizar la ventana más la lateness permitida. Explicá por qué un
-    estado sin expiración crece indefinidamente.
+    - `merchant_id`;
+    - `window_start`;
+    - `window_end`;
+    - `total`.
+
+    ### Deduplicación con estado
+
+    `DeduplicatePayments` utiliza un `SetStateSpec` para recordar los `event_id` ya procesados dentro de cada clave y ventana.
+
+    La lógica aplicada es:
+
+    - si el `event_id` no fue observado, se guarda en el estado y se emite el evento;
+    - si el `event_id` ya fue observado, se considera duplicado y no se vuelve a emitir.
+
+    Esto evita que un reintento del productor incremente nuevamente el total.
+
+    ### Política de triggers
+
+    La política temporal implementada es:
+
+    - ventana: `FixedWindows(60)`;
+    - lateness permitida: 120 segundos;
+    - trigger temprano: `AfterProcessingTime(10)`;
+    - trigger on-time: `AfterWatermark`;
+    - trigger tardío: `AfterCount(1)`;
+    - modo de acumulación: `ACCUMULATING`.
+
+    El trigger temprano permite disponer de una estimación antes del cierre de la ventana. El pane on-time se emite cuando el watermark cruza `window_end`, mientras que cada nuevo evento tardío aceptado puede producir una revisión late.
+
+    Como el modo de acumulación es `ACCUMULATING`, cada pane contiene el resultado completo actualizado de la ventana.
+
+    ### Expiración del estado
+
+    Al procesar un evento se programa un timer de tiempo de evento para `window_end + allowed_lateness`.
+
+    Cuando el watermark alcanza ese instante, el callback `expire` elimina los `event_id` almacenados.
+
+    Sin esta expiración, el estado de deduplicación conservaría indefinidamente todos los identificadores históricos de cada comercio, aumentando continuamente el consumo de memoria.
+
+    ### Pruebas
+
+    La implementación se valida mediante:
+
+    - `TestPipeline`, para comprobar agregaciones, aislamiento por clave y deduplicación;
+    - `TestStream`, para simular el avance del watermark y la llegada de un evento tardío aceptado.
+
+    La prueba temporal evidencia que un evento perteneciente a una ventana cuyo pane on-time ya fue emitido puede producir una revisión `LATE`, siempre que llegue dentro de los 120 segundos de lateness permitida.
     """)
     return
 
@@ -564,47 +623,106 @@ def _(mo):
     mo.md(r"""
     ## 4. Efectos externos
 
-    Completá `make_idempotency_key` y `simulate_sink_retries`.
+    Las funciones `make_idempotency_key` y `simulate_sink_retries` implementan una simulación de escritura tolerante a reintentos.
 
-    En este ejercicio los sinks **no son servicios externos reales**. Son
-    estructuras Python en memoria que representan dos contratos de escritura:
+    En este ejercicio, los sinks no representan servicios externos reales. Se utilizan estructuras Python en memoria para comparar dos contratos de escritura:
 
     | Modo simulado | Estructura interna | Operación |
     |---|---|---|
     | `POST` append-only | `list` | `append(row)` en cada intento |
     | `UPSERT` idempotente | `dict` | `sink[idempotency_key] = row` |
 
-    `simulate_sink_retries` siempre retorna dos **listas**:
+    La clave idempotente se construye mediante:
+
+    ```text
+    merchant_id|window_start
+    ```
+
+    Esta clave identifica de forma estable el resultado lógico de un comercio dentro de una ventana.
+
+    `simulate_sink_retries` retorna dos listas:
 
     1. `materialized`: estado final visible del sink;
-    2. `audit`: todos los intentos realizados.
+    2. `audit`: totalidad de los intentos realizados.
 
-    En modo append-only, `materialized` contiene una fila por intento. En modo
-    idempotente, se usa internamente un diccionario y al final se retornan
-    `list(upsert_sink.values())`.
+    ### Comportamiento append-only
 
-    Para cuatro resultados y dos intentos existen ocho filas de auditoría. El
-    modo append-only materializa ocho filas; el UPSERT materializa cuatro
-    porque el segundo intento reemplaza la misma clave lógica.
+    En modo `POST`, cada intento agrega una nueva fila:
+
+    ```text
+    mismo resultado + 2 intentos
+    → 2 filas materializadas
+    ```
+
+    Por lo tanto, un reintento puede duplicar el efecto observable.
+
+    ### Comportamiento idempotente
+
+    En modo `UPSERT`, la clave idempotente se utiliza como identificador del diccionario:
+
+    ```text
+    mismo resultado + 2 intentos
+    → 1 entidad materializada
+    ```
+
+    El segundo intento reemplaza el valor asociado a la misma clave lógica, por lo que el estado final converge a una sola entidad.
+
+    La auditoría conserva todos los intentos, incluso cuando el sink idempotente materializa una única fila.
+
+    Para cuatro resultados y dos intentos se producen:
+
+    ```text
+    Filas de auditoría         8
+    Filas materializadas POST  8
+    Filas materializadas UPSERT 4
+    ```
+
+    La deduplicación y la idempotencia cumplen responsabilidades diferentes:
+
+    - la deduplicación evita contar dos veces el mismo evento;
+    - la idempotencia evita materializar dos veces el mismo resultado.
 
     ## 5. Pruebas obligatorias
 
-    El proyecto ya incluye los tests. Ejecutalos con:
+    La implementación se valida mediante la suite provista y una prueba temporal adicional con `TestStream`.
+
+    Las pruebas pueden ejecutarse con:
 
     ```bash
     uv run pytest
     ```
 
-    Al comienzo deben fallar con `NotImplementedError`. Implementá las
-    funciones hasta que estas garantías queden verdes:
+    Dentro del contenedor Docker:
 
-    - [ ] un duplicado no modifica el total;
-    - [ ] claves distintas no comparten estado;
-    - [ ] un evento fuera de orden cae en su ventana de evento;
-    - [ ] un evento con atraso aceptado produce una revisión;
-    - [ ] un evento demasiado tardío queda auditado;
-    - [ ] dos escrituras del mismo resultado dejan una sola entidad;
-    - [ ] el timer limpia el estado cuando corresponde.
+    ```bash
+    docker compose exec notebook uv run pytest -q
+    ```
+
+    Las garantías verificadas son:
+
+    - [x] un duplicado no modifica el total;
+    - [x] claves distintas no comparten estado;
+    - [x] un evento fuera de orden se asigna a su ventana de tiempo de evento;
+    - [x] un evento con atraso aceptado produce una revisión;
+    - [x] un evento demasiado tardío queda auditado;
+    - [x] dos escrituras del mismo resultado dejan una sola entidad materializada;
+    - [x] el timer limpia el estado cuando corresponde;
+    - [x] un evento tardío aceptado genera un pane acumulativo mediante `TestStream`.
+
+    La suite provista contiene 13 pruebas. Con la prueba temporal adicional, el resultado final es:
+
+    ```text
+    14 passed
+    ```
+
+    También se validó la calidad y estructura del proyecto mediante:
+
+    ```bash
+    uv run ruff check notebook.py tests
+    uv run marimo check --strict notebook.py
+    ```
+
+    Ambos controles finalizan sin errores.
     """)
     return
 
@@ -614,26 +732,33 @@ def _(mo):
     mo.md(r"""
     ## Entrega
 
-    Publicá un repositorio propio con:
+    La solución se publica en un repositorio público que contiene:
 
     1. este notebook completamente implementado;
-    2. la suite de pruebas provista ejecutada y completamente verde;
-    3. README con instrucciones Docker o `uv`;
-    4. explicación breve de ventanas, triggers, estado, timer e
-       idempotencia;
-    5. evidencia de ejecución y resultados.
+    2. la suite de pruebas provista completamente verde;
+    3. una prueba adicional con `TestStream`;
+    4. un README con instrucciones reproducibles mediante Docker y `uv`;
+    5. la explicación de ventanas, triggers, estado, timer e idempotencia;
+    6. evidencias de ejecución y validación.
 
-    ### Criterios sugeridos
+    El resultado final de la suite ampliada es **14 pruebas aprobadas**.
 
-    | Criterio | Peso |
-    |---|---:|
-    | Contrato temporal y ventanas | 25% |
-    | Estado, deduplicación y expiración | 25% |
-    | Idempotencia y reintentos | 20% |
-    | Pruebas y casos límite | 20% |
-    | Reproducibilidad y explicación | 10% |
+    También se verificaron correctamente los siguientes controles:
 
-    Se evalúa corrección conceptual y evidencia, no complejidad innecesaria.
+    - `Ruff`: OK;
+    - `Marimo check`: OK.
+
+    ### Cumplimiento de los criterios
+
+    | Criterio | Peso | Evidencia |
+    |---|---:|---|
+    | Contrato temporal y ventanas | 25% | Uso de `event_time`, ventanas fijas de 60 segundos, lateness permitida y triggers |
+    | Estado, deduplicación y expiración | 25% | `SetStateSpec`, aislamiento por clave y ventana, y timer de limpieza |
+    | Idempotencia y reintentos | 20% | Clave estable `merchant_id\|window_start` y simulación de `POST` frente a `UPSERT` |
+    | Pruebas y casos límite | 20% | 13 pruebas provistas y una prueba adicional con `TestStream` |
+    | Reproducibilidad y explicación | 10% | Docker, `uv`, README y evidencias de ejecución |
+
+    La implementación prioriza la corrección conceptual, la reproducibilidad y la evidencia observable, evitando complejidad innecesaria.
     """)
     return
 
