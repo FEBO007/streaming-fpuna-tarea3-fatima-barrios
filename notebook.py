@@ -299,7 +299,7 @@ def _(mo):
 
     Este contrato permite comparar una lógica local y determinista con el resultado producido posteriormente por Apache Beam.
 
-    Los conteos se corresponden con el dataset actual: contiene nueve registros; cinco pagos confirmados, únicos y dentro de tolerancia generan cuatro combinaciones de comercio y ventana. :contentReference[oaicite:0]{index=0}
+    Los conteos se corresponden con el dataset actual: contiene nueve registros; cinco pagos confirmados, únicos y dentro de tolerancia generan cuatro combinaciones de comercio y ventana.
     """)
     return
 
